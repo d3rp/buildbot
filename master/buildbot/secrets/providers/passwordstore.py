@@ -17,10 +17,9 @@ password store based provider
 """
 
 import os
+import subprocess
+from glob import glob
 from pathlib import Path
-
-from twisted.internet import defer
-from twisted.internet import utils
 
 from buildbot import config
 from buildbot.secrets.providers.base import SecretProviderBase
@@ -32,37 +31,43 @@ class SecretInPass(SecretProviderBase):
     """
     name = "SecretInPass"
 
-    def checkPassIsInPath(self):
-        if not any([(Path(p) / "pass").is_file() for p in os.environ["PATH"].split(":")]):
-            config.error("pass does not exist in PATH")
-
     def checkPassDirectoryIsAvailableAndReadable(self, dirname):
         if not os.access(dirname, os.F_OK):
             config.error("directory %s does not exist" % dirname)
 
     def checkConfig(self, gpgPassphrase=None, dirname=None):
-        self.checkPassIsInPath()
         if dirname:
             self.checkPassDirectoryIsAvailableAndReadable(dirname)
 
     def reconfigService(self, gpgPassphrase=None, dirname=None):
         self._env = {**os.environ}
         if gpgPassphrase:
-            self._env["PASSWORD_STORE_GPG_OPTS"] = "--passphrase %s" % gpgPassphrase
-        if dirname:
-            self._env["PASSWORD_STORE_DIR"] = dirname
+            self.pw = gpgPassphrase
+        else:
+            self.pw = None
 
-    @defer.inlineCallbacks
+        if dirname is None:
+            self.pw_dir = Path.home() / '.password-store'
+        else:
+            self.pw_dir = Path(dirname)
+
+        self.secrets = set(s[:-4] for s in glob(f'{self.pw_dir}/**/*.gpg'))
+
     def get(self, entry):
         """
         get the value from pass identified by 'entry'
         """
+        in_file = os.fspath(self.pw_dir / f'{entry}.gpg')
+        if self.pw is None:
+            gpg_args = tuple(['--batch', '-qd', in_file])
+        else:
+            gpg_args = tuple(['--batch', '--pinentry-mode', 'loopback', '--passphrase', self.pw, '-qd', in_file])
         try:
-            output = yield utils.getProcessOutput(
-                "pass",
-                args=[entry],
-                env=self._env
-            )
-            return output.decode("utf-8", "ignore").splitlines()[0]
+            stdout = subprocess.check_output(['gpg', *gpg_args], universal_newlines=True)
+
         except IOError:
             return None
+
+        first_line = stdout.splitlines()[0]
+        secret = first_line.strip()
+        return secret
